@@ -84,6 +84,58 @@ export function computeProposalHash(filePath: string, edits: ProposedEditItem[])
   return crypto.createHash('sha256').update(JSON.stringify(norm)).digest('hex');
 }
 
+export function normalizeProposeEditArgs(raw: any): { path: string; edits: ProposedEditItem[]; summary?: string } | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  let input = raw;
+  if (typeof raw.input === 'string') {
+    try {
+      input = JSON.parse(raw.input);
+    } catch {
+      input = raw.input;
+    }
+  } else if (raw.input && typeof raw.input === 'object') {
+    input = raw.input;
+  }
+
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+
+  const filePath = typeof input.path === 'string' ? input.path : (typeof raw.path === 'string' ? raw.path : '');
+  if (!filePath) {
+    return null;
+  }
+
+  const summary = typeof input.summary === 'string' ? input.summary : (typeof raw.summary === 'string' ? raw.summary : undefined);
+
+  if (Array.isArray(input.edits)) {
+    const edits: ProposedEditItem[] = [];
+    for (const e of input.edits) {
+      if (e && typeof e.old_text === 'string' && typeof e.new_text === 'string') {
+        edits.push({ old_text: e.old_text, new_text: e.new_text });
+      } else {
+        return null;
+      }
+    }
+    if (edits.length === 0) {
+      return null;
+    }
+    return { path: filePath, edits, summary };
+  }
+
+  if (typeof input.old_text === 'string' && typeof input.new_text === 'string') {
+    return {
+      path: filePath,
+      edits: [{ old_text: input.old_text, new_text: input.new_text }],
+      summary
+    };
+  }
+
+  return null;
+}
+
 export function countOccurrences(source: string, target: string): number {
   if (!target) {
     return 0;
@@ -463,37 +515,52 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
     }
   );
 
-  // 4. propose_edit(path, edits, summary)
+  // 4. propose_edit(path, old_text?, new_text?, edits?, summary?)
   server.registerTool(
     'propose_edit',
     {
-      description: 'Propose edits to a file in the workspace. Edits is a list of {old_text, new_text}. old_text must match exactly once in the file (or empty string if creating a new file). Edits require user approval before writing to disk.',
+      description: 'Propose edits to a file in the workspace. Accepts either {path, old_text, new_text, summary?} or {path, edits: [{old_text, new_text}], summary?}. old_text must match exactly once in the file (or empty string if creating a new file). Edits require user approval before writing to disk.',
       inputSchema: {
         path: z.string().describe('File path relative to the workspace folder'),
+        old_text: z.string().optional().describe('Exact text to replace (empty string if creating a new file)'),
+        new_text: z.string().optional().describe('Replacement text'),
         edits: z.array(z.object({
           old_text: z.string().describe('Exact text to replace (empty string if creating a new file)'),
           new_text: z.string().describe('Replacement text')
-        })).min(1).describe('List of edits to apply'),
-        summary: z.string().describe('Summary of the proposed changes')
+        })).optional().describe('List of edits to apply'),
+        summary: z.string().optional().describe('Summary of the proposed changes')
       }
     },
     async (args) => {
       outputChannel.appendLine(`[${new Date().toISOString()}] Tool called: propose_edit for ${args.path}`);
-      outputChannel.appendLine(`[propose_edit] Summary: ${args.summary}`);
+
+      const normalized = normalizeProposeEditArgs(args);
+      if (!normalized) {
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'Error in propose_edit: propose_edit expects {path, old_text, new_text} or {path, edits: [{old_text, new_text}]}.'
+          }]
+        };
+      }
+
+      const { path: normPath, edits: normEdits, summary: normSummary } = normalized;
+      outputChannel.appendLine(`[propose_edit] Summary: ${normSummary || '(none)'}`);
 
       try {
         const root = getWorkspaceRoot();
-        const targetPath = resolveWorkspacePath(args.path, root);
+        const targetPath = resolveWorkspacePath(normPath, root);
         const fileExists = fs.existsSync(targetPath);
 
         let originalContent = '';
         if (!fileExists) {
-          if (args.edits.length !== 1 || args.edits[0].old_text !== '') {
+          if (normEdits.length !== 1 || normEdits[0].old_text !== '') {
             return {
               isError: true,
               content: [{
                 type: 'text',
-                text: `Error: File does not exist: ${args.path}. An empty old_text ("") on a path that does not exist creates the file. Please re-read the workspace and retry.`
+                text: `Error: File does not exist: ${normPath}. An empty old_text ("") on a path that does not exist creates the file. Please re-read the workspace and retry.`
               }]
             };
           }
@@ -502,15 +569,15 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
           if (!stat.isFile()) {
             return {
               isError: true,
-              content: [{ type: 'text', text: `Error: Path is not a file: ${args.path}` }]
+              content: [{ type: 'text', text: `Error: Path is not a file: ${normPath}` }]
             };
           }
 
           originalContent = await fs.promises.readFile(targetPath, 'utf-8');
 
           let simulated = originalContent;
-          for (let i = 0; i < args.edits.length; i++) {
-            const edit = args.edits[i];
+          for (let i = 0; i < normEdits.length; i++) {
+            const edit = normEdits[i];
             if (edit.old_text === '') {
               return {
                 isError: true,
@@ -527,7 +594,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
                 isError: true,
                 content: [{
                   type: 'text',
-                  text: `Error in edit ${i + 1}: old_text was not found in ${args.path}. Please re-read the file and retry with exact text.`
+                  text: `Error in edit ${i + 1}: old_text was not found in ${normPath}. Please re-read the file and retry with exact text.`
                 }]
               };
             }
@@ -536,7 +603,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
                 isError: true,
                 content: [{
                   type: 'text',
-                  text: `Error in edit ${i + 1}: old_text matched ${count} times in ${args.path}. It must match exactly once. Please re-read the file with more surrounding context and retry.`
+                  text: `Error in edit ${i + 1}: old_text matched ${count} times in ${normPath}. It must match exactly once. Please re-read the file with more surrounding context and retry.`
                 }]
               };
             }
@@ -547,15 +614,15 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         }
 
         // Check if decision exists for this proposal
-        const hash = computeProposalHash(args.path, args.edits);
+        const hash = computeProposalHash(normPath, normEdits);
         const decision = pendingDecisions.get(hash);
 
         if (!decision || decision.acceptedHunks.size === 0) {
-          outputChannel.appendLine(`[propose_edit] No accepted hunks for ${args.path} (hash: ${hash}). Disk write skipped.`);
+          outputChannel.appendLine(`[propose_edit] No accepted hunks for ${normPath} (hash: ${hash}). Disk write skipped.`);
           return {
             content: [{
               type: 'text',
-              text: `Proposed edits for ${args.path} were rejected by user. No changes were written to disk.`
+              text: `Proposed edits for ${normPath} were rejected by user. No changes were written to disk.`
             }]
           };
         }
@@ -564,18 +631,18 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         let patchedContent = '';
         if (!fileExists) {
           if (decision.acceptedHunks.has(0)) {
-            patchedContent = args.edits[0].new_text;
+            patchedContent = normEdits[0].new_text;
           } else {
             return {
               content: [{
                 type: 'text',
-                text: `Creation of ${args.path} was rejected by user. File was not created.`
+                text: `Creation of ${normPath} was rejected by user. File was not created.`
               }]
             };
           }
         } else {
           let targetContent = originalContent;
-          for (const edit of args.edits) {
+          for (const edit of normEdits) {
             const idx = targetContent.indexOf(edit.old_text);
             if (idx !== -1) {
               targetContent = targetContent.slice(0, idx) + edit.new_text + targetContent.slice(idx + edit.old_text.length);
@@ -594,7 +661,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
               return {
                 content: [{
                   type: 'text',
-                  text: `All hunks for ${args.path} were rejected. No changes applied.`
+                  text: `All hunks for ${normPath} were rejected. No changes applied.`
                 }]
               };
             }
@@ -635,7 +702,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
 
         const applied = await vscode.workspace.applyEdit(wsEdit);
         if (!applied) {
-          throw new Error(`Failed to apply WorkspaceEdit to ${args.path}`);
+          throw new Error(`Failed to apply WorkspaceEdit to ${normPath}`);
         }
 
         const doc = await vscode.workspace.openTextDocument(uri);
@@ -651,7 +718,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
           hunkLines.push(`- Hunk ${i + 1}: ${decision.acceptedHunks.has(i) ? 'applied' : 'rejected'}`);
         }
 
-        const summaryText = `Applied ${appliedCount} of ${decision.totalHunks} hunk(s) to ${args.path} (${rejectedCount} rejected).\n${hunkLines.join('\n')}`;
+        const summaryText = `Applied ${appliedCount} of ${decision.totalHunks} hunk(s) to ${normPath} (${rejectedCount} rejected).\n${hunkLines.join('\n')}`;
         outputChannel.appendLine(`[propose_edit] Summary: ${summaryText}`);
 
         return {
@@ -728,6 +795,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
   private _history: Array<{ type: string; [key: string]: any }> = [];
   private _turnToolCalls = new Map<string, any>();
   private _activeReviewPanel?: vscode.WebviewPanel;
+  private _consecutiveAutoDenials: number = 0;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -985,10 +1053,6 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
 
             case 'tool.approval_required': {
               this._outputChannel.appendLine(`[Forge Agent Chat] tool.approval_required received with ${event.tool_calls?.length ?? 0} tool call(s)`);
-              const approvalNotice = { type: 'approvalRequired' };
-              this._history.push(approvalNotice);
-              this._postToWebview(approvalNotice);
-
               await this._handleApprovalRequired(event);
               break;
             }
@@ -998,6 +1062,11 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
                 const cancelMsg = { type: 'cancelled' };
                 this._history.push(cancelMsg);
                 this._postToWebview(cancelMsg);
+              } else if (event.state?.status === 'error') {
+                const errMsgText = event.state?.error?.message || event.state?.error || event.error?.message || event.error || 'Turn ended with error.';
+                const errorMsg = { type: 'error', message: typeof errMsgText === 'string' ? errMsgText : JSON.stringify(errMsgText) };
+                this._history.push(errorMsg);
+                this._postToWebview(errorMsg);
               }
               break;
             }
@@ -1030,79 +1099,95 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       }
 
       let toolName = tc.function?.name || tc.tool_info?.name || '';
-      let input: any = {};
+      let rawArgs: any = {};
       try {
-        const parsed = JSON.parse(tc.function?.arguments || '{}');
+        rawArgs = JSON.parse(tc.function?.arguments || '{}');
         if (toolName === 'call_tool') {
-          toolName = parsed.tool_name || '';
-          input = parsed.input || {};
-        } else {
-          input = parsed;
+          toolName = rawArgs.tool_name || '';
         }
       } catch {
         // ignore parse error
       }
 
-      if (toolName === 'propose_edit' && input.path && Array.isArray(input.edits)) {
-        try {
-          const targetPath = resolveWorkspacePath(input.path, root);
-          const relPath = path.relative(root, targetPath).replace(/\\/g, '/');
-          const fileExists = fs.existsSync(targetPath);
-          const originalContent = fileExists ? await fs.promises.readFile(targetPath, 'utf-8') : '';
+      if (toolName === 'propose_edit') {
+        const normalized = normalizeProposeEditArgs(rawArgs);
+        if (normalized) {
+          try {
+            const targetPath = resolveWorkspacePath(normalized.path, root);
+            const relPath = path.relative(root, targetPath).replace(/\\/g, '/');
+            const fileExists = fs.existsSync(targetPath);
+            const originalContent = fileExists ? await fs.promises.readFile(targetPath, 'utf-8') : '';
 
-          let proposedContent = '';
-          if (!fileExists) {
-            proposedContent = input.edits[0]?.new_text ?? '';
-          } else {
-            let sim = originalContent;
-            for (const edit of input.edits) {
-              const idx = sim.indexOf(edit.old_text);
-              if (idx !== -1) {
-                sim = sim.slice(0, idx) + edit.new_text + sim.slice(idx + edit.old_text.length);
+            let proposedContent = '';
+            if (!fileExists) {
+              proposedContent = normalized.edits[0]?.new_text ?? '';
+            } else {
+              let sim = originalContent;
+              for (const edit of normalized.edits) {
+                const idx = sim.indexOf(edit.old_text);
+                if (idx !== -1) {
+                  sim = sim.slice(0, idx) + edit.new_text + sim.slice(idx + edit.old_text.length);
+                }
               }
+              proposedContent = sim;
             }
-            proposedContent = sim;
+
+            const patchStr = diff.createTwoFilesPatch(relPath, relPath, originalContent, proposedContent, '', '', { context: 3 });
+            const parsed = diff.parsePatch(patchStr);
+            const rawHunks = parsed[0]?.hunks || [];
+
+            const hunks = rawHunks.map((h: any) => ({
+              oldStart: h.oldStart,
+              oldLines: h.oldLines,
+              newStart: h.newStart,
+              newLines: h.newLines,
+              lines: h.lines
+            }));
+
+            proposals.push({
+              toolCallId: ref.id,
+              threadId,
+              path: normalized.path,
+              summary: normalized.summary || 'Proposed changes',
+              originalContent,
+              proposedContent,
+              edits: normalized.edits,
+              hunks
+            });
+          } catch (err: any) {
+            this._outputChannel.appendLine(`[Forge Agent Review] Error preparing proposal for ${normalized.path}: ${err.message}`);
           }
-
-          const patchStr = diff.createTwoFilesPatch(relPath, relPath, originalContent, proposedContent, '', '', { context: 3 });
-          const parsed = diff.parsePatch(patchStr);
-          const rawHunks = parsed[0]?.hunks || [];
-
-          const hunks = rawHunks.map((h: any) => ({
-            oldStart: h.oldStart,
-            oldLines: h.oldLines,
-            newStart: h.newStart,
-            newLines: h.newLines,
-            lines: h.lines
-          }));
-
-          proposals.push({
-            toolCallId: ref.id,
-            threadId,
-            path: input.path,
-            summary: input.summary || 'Proposed changes',
-            originalContent,
-            proposedContent,
-            edits: input.edits,
-            hunks
-          });
-        } catch (err: any) {
-          this._outputChannel.appendLine(`[Forge Agent Review] Error preparing proposal for ${input.path}: ${err.message}`);
         }
       }
     }
 
     if (proposals.length === 0) {
-      this._outputChannel.appendLine('[Forge Agent Review] No valid propose_edit tool calls found to review. Denying pending calls.');
+      this._consecutiveAutoDenials++;
+      this._outputChannel.appendLine(`[Forge Agent Review] Invalid propose_edit arguments. Consecutive count: ${this._consecutiveAutoDenials}`);
+
+      if (this._consecutiveAutoDenials >= 3) {
+        this._outputChannel.appendLine('[Forge Agent Review] Auto-denied 3 times in a row for invalid arguments. Stopping denials and ending run.');
+        this._consecutiveAutoDenials = 0;
+        const errorMsg = { type: 'error', message: 'The agent sent invalid edits repeatedly.' };
+        this._history.push(errorMsg);
+        this._postToWebview(errorMsg);
+        return;
+      }
+
       const denyInputs = toolCallRefs.map(ref => ({
         type: 'user.tool_approval',
         thread_id: threadId,
         tool_call_id: ref.id,
-        approval: { status: 'deny', reason: 'No valid edit proposals found.' }
+        approval: { status: 'deny', reason: 'propose_edit expects {path, old_text, new_text}' }
       }));
       await this._runTurn(denyInputs);
       return;
     }
+
+    this._consecutiveAutoDenials = 0;
+    const approvalNotice = { type: 'approvalRequired' };
+    this._history.push(approvalNotice);
+    this._postToWebview(approvalNotice);
 
     this._openReviewPanel(proposals, toolCallRefs, threadId);
   }
@@ -1575,6 +1660,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     this._isRunning = false;
     this._history = [];
     this._turnToolCalls.clear();
+    this._consecutiveAutoDenials = 0;
     this._postToWebview({ type: 'resetChat' });
     this._outputChannel.appendLine('[Forge Agent Chat] New chat session started.');
   }
