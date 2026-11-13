@@ -19,7 +19,40 @@
         "command": "forge-agent.hello",
         "title": "Forge Agent: Hello"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "forge-agent-chat",
+          "title": "Forge Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "forge-agent-chat": [
+        {
+          "type": "webview",
+          "id": "forge-agent.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Forge Agent",
+      "properties": {
+        "forgeAgent.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8790",
+          "description": "Base URL of the TrueForge server"
+        },
+        "forgeAgent.agentName": {
+          "type": "string",
+          "default": "editor-test",
+          "description": "Agent name to use for chat sessions"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
