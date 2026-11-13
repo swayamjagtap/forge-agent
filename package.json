@@ -18,6 +18,10 @@
       {
         "command": "forge-agent.hello",
         "title": "Forge Agent: Hello"
+      },
+      {
+        "command": "forge-agent.undoLastAppliedChange",
+        "title": "Forge Agent: Undo last applied change"
       }
     ],
     "viewsContainers": {
@@ -67,6 +71,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@types/diff": "^7.0.2",
+    "diff": "^9.0.0",
     "express": "^5.3.0",
     "zod": "^4.6.7"
   }
