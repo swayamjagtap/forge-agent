@@ -22,8 +22,28 @@
       {
         "command": "forge-agent.undoLastAppliedChange",
         "title": "Forge Agent: Undo last applied change"
+      },
+      {
+        "command": "forgeAgent.editSelection",
+        "title": "Forge Agent: Edit Selection"
       }
     ],
+    "keybindings": [
+      {
+        "command": "forgeAgent.editSelection",
+        "key": "ctrl+alt+k",
+        "when": "editorHasSelection"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "forgeAgent.editSelection",
+          "when": "editorHasSelection",
+          "group": "modification"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {

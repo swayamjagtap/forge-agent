@@ -136,6 +136,10 @@ export function normalizeProposeEditArgs(raw: any): { path: string; edits: Propo
   return null;
 }
 
+export function fitEol(text: string, eol: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\n/g, eol);
+}
+
 export function countOccurrences(source: string, target: string): number {
   if (!target) {
     return 0;
@@ -603,7 +607,8 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         };
       }
 
-      const { path: normPath, edits: normEdits, summary: normSummary } = normalized;
+      const { path: normPath, edits: rawEdits, summary: normSummary } = normalized;
+      let normEdits = rawEdits;
       outputChannel.appendLine(`[propose_edit] Summary: ${normSummary || '(none)'}`);
 
       try {
@@ -632,6 +637,8 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
           }
 
           originalContent = await fs.promises.readFile(targetPath, 'utf-8');
+          const fileEol = originalContent.includes('\r\n') ? '\r\n' : '\n';
+          normEdits = rawEdits.map((e) => ({ old_text: fitEol(e.old_text, fileEol), new_text: fitEol(e.new_text, fileEol) }));
 
           let simulated = originalContent;
           for (let i = 0; i < normEdits.length; i++) {
@@ -672,7 +679,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         }
 
         // Check if decision exists for this proposal
-        const hash = computeProposalHash(normPath, normEdits);
+        const hash = computeProposalHash(normPath, rawEdits);
         const decision = pendingDecisions.get(hash);
 
         if (!decision || decision.acceptedHunks.size === 0) {
@@ -796,10 +803,14 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
 }
 
 export function formatToolCall(name: string, argsStr: string): { displayName: string; isMeta: boolean; realToolName: string; input: any } {
-  let parsed: any = {};
-  try {
-    parsed = JSON.parse(argsStr || '{}');
-  } catch {}
+  let parsed: any = parseToolArguments(argsStr);
+  if (!parsed) {
+    try {
+      parsed = JSON.parse(argsStr || '{}');
+    } catch {
+      parsed = {};
+    }
+  }
 
   if (name === 'list_tools' || name === 'get_tool_info') {
     const target = parsed.tool_name || parsed.mcp_server || '';
@@ -817,14 +828,38 @@ export function formatToolCall(name: string, argsStr: string): { displayName: st
   if (name === 'call_tool') {
     realName = parsed.tool_name || 'tool';
     input = parsed.input || {};
+    if (typeof input === 'string') {
+      const parsedInner = parseToolArguments(input);
+      if (parsedInner && typeof parsedInner === 'object') {
+        input = parsedInner;
+      }
+    }
+  }
+
+  if (realName === 'list_tools' || realName === 'get_tool_info') {
+    const target = input.tool_name || input.mcp_server || '';
+    return {
+      displayName: target ? `${realName} ${target}` : realName,
+      isMeta: true,
+      realToolName: realName,
+      input
+    };
   }
 
   let argStr = '';
   if (typeof input === 'string') {
     argStr = input;
   } else if (typeof input === 'object' && input !== null) {
-    if (input.path) {
+    if (realName === 'propose_edit' && input.path) {
       argStr = input.path;
+    } else if (input.path) {
+      if (input.startLine !== undefined && input.endLine !== undefined) {
+        argStr = `${input.path} ${input.startLine}-${input.endLine}`;
+      } else if (input.startLine !== undefined) {
+        argStr = `${input.path} ${input.startLine}`;
+      } else {
+        argStr = input.path;
+      }
     } else if (input.query) {
       argStr = `"${input.query}"`;
     } else if (input.subdirectory) {
@@ -893,6 +928,26 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
           break;
       }
     });
+  }
+
+  public async cancel(): Promise<void> {
+    await this._handleCancel();
+  }
+
+  public async startNewChat(): Promise<void> {
+    await this._handleNewChat();
+  }
+
+  public async sendTurnMessage(text: string): Promise<void> {
+    const userMsg = { type: 'userMessage', text };
+    this._history.push(userMsg);
+    this._postToWebview(userMsg);
+
+    await this._runTurn([{ type: 'user.message', content: text }]);
+  }
+
+  public isRunning(): boolean {
+    return this._isRunning;
   }
 
   private _postToWebview(message: any) {
@@ -1046,10 +1101,21 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
                   const formatted = formatToolCall(rawName, rawArgs);
                   const toolKey = tc.id || `${id}-${formatted.displayName}`;
 
-                  if (!seenToolCalls.has(toolKey)) {
+                  const existingIndex = this._history.findIndex(h => h.type === 'toolCall' && h.toolCallId === tc.id);
+                  if (existingIndex !== -1) {
+                    this._history[existingIndex].displayName = formatted.displayName;
+                    this._history[existingIndex].isMeta = formatted.isMeta;
+                    this._postToWebview({
+                      type: 'toolCall',
+                      toolCallId: tc.id,
+                      displayName: formatted.displayName,
+                      isMeta: formatted.isMeta
+                    });
+                  } else if (!seenToolCalls.has(toolKey)) {
                     seenToolCalls.add(toolKey);
                     const toolMsg = {
                       type: 'toolCall',
+                      toolCallId: tc.id,
                       displayName: formatted.displayName,
                       isMeta: formatted.isMeta
                     };
@@ -1078,6 +1144,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
 
               if (Array.isArray(event.tool_calls)) {
                 for (const tc of event.tool_calls) {
+                  let currentTc = tc;
                   if (tc.id) {
                     const existing = this._turnToolCalls.get(tc.id);
                     if (existing) {
@@ -1085,19 +1152,32 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
                         existing.function = existing.function || {};
                         existing.function.arguments = (existing.function.arguments || '') + tc.function.arguments;
                       }
+                      currentTc = existing;
                     } else {
                       this._turnToolCalls.set(tc.id, tc);
                     }
                   }
-                  const rawName = tc.function?.name || tc.tool_info?.name || '';
-                  const rawArgs = tc.function?.arguments || '';
+                  const rawName = currentTc.function?.name || currentTc.tool_info?.name || '';
+                  const rawArgs = currentTc.function?.arguments || '';
                   if (rawName) {
                     const formatted = formatToolCall(rawName, rawArgs);
-                    const toolKey = tc.id || `${id}-${formatted.displayName}`;
-                    if (!seenToolCalls.has(toolKey)) {
+                    const toolKey = currentTc.id || `${id}-${formatted.displayName}`;
+
+                    const existingIndex = this._history.findIndex(h => h.type === 'toolCall' && h.toolCallId === currentTc.id);
+                    if (existingIndex !== -1) {
+                      this._history[existingIndex].displayName = formatted.displayName;
+                      this._history[existingIndex].isMeta = formatted.isMeta;
+                      this._postToWebview({
+                        type: 'toolCall',
+                        toolCallId: currentTc.id,
+                        displayName: formatted.displayName,
+                        isMeta: formatted.isMeta
+                      });
+                    } else if (!seenToolCalls.has(toolKey)) {
                       seenToolCalls.add(toolKey);
                       const toolMsg = {
                         type: 'toolCall',
+                        toolCallId: currentTc.id,
                         displayName: formatted.displayName,
                         isMeta: formatted.isMeta
                       };
@@ -1150,6 +1230,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
 
     const proposals: PendingReviewProposal[] = [];
 
+    const invalidReasons = new Map<string, string>();
     for (const ref of toolCallRefs) {
       let normalized = this._resolveProposeEdit(this._turnToolCalls.get(ref.id));
       if (!normalized) {
@@ -1172,19 +1253,33 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
         const relPath = path.relative(root, targetPath).replace(/\\/g, '/');
         const fileExists = fs.existsSync(targetPath);
         const originalContent = fileExists ? await fs.promises.readFile(targetPath, 'utf-8') : '';
+        const fileEol = originalContent.includes('\r\n') ? '\r\n' : '\n';
 
         let proposedContent = '';
+        let editProblem: string | null = null;
         if (!fileExists) {
           proposedContent = normalized.edits[0]?.new_text ?? '';
         } else {
           let sim = originalContent;
           for (const edit of normalized.edits) {
-            const idx = sim.indexOf(edit.old_text);
-            if (idx !== -1) {
-              sim = sim.slice(0, idx) + edit.new_text + sim.slice(idx + edit.old_text.length);
+            const oldFit = fitEol(edit.old_text, fileEol);
+            const newFit = fitEol(edit.new_text, fileEol);
+            const occurrences = oldFit === '' ? 0 : countOccurrences(sim, oldFit);
+            if (occurrences !== 1) {
+              editProblem = occurrences === 0
+                ? `old_text was not found in ${normalized.path}`
+                : `old_text matched ${occurrences} times in ${normalized.path}`;
+              break;
             }
+            const idx = sim.indexOf(oldFit);
+            sim = sim.slice(0, idx) + newFit + sim.slice(idx + oldFit.length);
           }
           proposedContent = sim;
+        }
+        if (editProblem) {
+          invalidReasons.set(ref.id, `${editProblem}. Call read_file to see the exact lines, copy a short unique old_text (1 to 3 lines) exactly, and call propose_edit again.`);
+          this._outputChannel.appendLine(`[Forge Agent Review] ${editProblem} (call ${ref.id}); denying with a hint for the agent`);
+          continue;
         }
 
         const patchStr = diff.createTwoFilesPatch(relPath, relPath, originalContent, proposedContent, '', '', { context: 3 });
@@ -1231,7 +1326,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
         type: 'user.tool_approval',
         thread_id: threadId,
         tool_call_id: ref.id,
-        approval: { status: 'deny', reason: 'propose_edit expects {path, old_text, new_text}' }
+        approval: { status: 'deny', reason: invalidReasons.get(ref.id) ?? 'propose_edit expects {path, old_text, new_text}' }
       }));
       await this._runTurn(denyInputs);
       return;
@@ -2088,10 +2183,19 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
         case 'toolCall': {
           hideEmptyState();
           lastItemIsCancelled = false;
-          const div = document.createElement('div');
-          div.className = data.isMeta ? 'tool-call-line dimmed' : 'tool-call-line';
-          div.textContent = data.displayName;
-          messagesContainer.appendChild(div);
+          let div = data.toolCallId ? messagesContainer.querySelector('[data-tool-call-id="' + data.toolCallId + '"]') : null;
+          if (div) {
+            div.className = data.isMeta ? 'tool-call-line dimmed' : 'tool-call-line';
+            div.textContent = data.displayName;
+          } else {
+            div = document.createElement('div');
+            div.className = data.isMeta ? 'tool-call-line dimmed' : 'tool-call-line';
+            if (data.toolCallId) {
+              div.setAttribute('data-tool-call-id', data.toolCallId);
+            }
+            div.textContent = data.displayName;
+            messagesContainer.appendChild(div);
+          }
           scrollToBottom();
           break;
         }
@@ -2207,6 +2311,76 @@ export function activate(context: vscode.ExtensionContext) {
     await undoLastAppliedChange(outputChannel);
   });
   context.subscriptions.push(undoCommand);
+
+  // Register command "Forge Agent: Edit Selection"
+  const editSelectionCommand = vscode.commands.registerCommand('forgeAgent.editSelection', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) {
+      vscode.window.showWarningMessage('No active editor.');
+      return;
+    }
+
+    const selection = editor.selection;
+    if (selection.isEmpty) {
+      vscode.window.showWarningMessage('No text selected.');
+      return;
+    }
+
+    let workspaceRoot: string;
+    try {
+      workspaceRoot = getWorkspaceRoot();
+    } catch (e: any) {
+      vscode.window.showErrorMessage(e.message);
+      return;
+    }
+
+    const fullPath = editor.document.uri.fsPath;
+    const relPath = path.relative(workspaceRoot, fullPath).replace(/\\/g, '/');
+    if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
+      vscode.window.showErrorMessage('The active file is outside the workspace folder.');
+      return;
+    }
+
+    const startLine = selection.start.line + 1;
+    const endLine = selection.end.line + 1;
+    const selectedText = editor.document.getText(selection);
+
+    const instruction = await vscode.window.showInputBox({
+      prompt: 'Instructions for editing the selected code',
+      placeHolder: 'e.g. Add type annotations and docstring'
+    });
+
+    if (!instruction || !instruction.trim()) {
+      return;
+    }
+
+    await vscode.commands.executeCommand('forge-agent.chatView.focus');
+
+    await chatProvider.startNewChat();
+
+    const turnPrompt = `Inline edit request. File: ${relPath}, lines ${startLine}-${endLine}: ${selectedText}. Instruction: ${instruction.trim()}. Only change this file. Call propose_edit once with old_text copied exactly from the file and new_text. Do not ask questions.`;
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Forge Agent: Editing selection...',
+        cancellable: true
+      },
+      async (_progress, token) => {
+        token.onCancellationRequested(async () => {
+          outputChannel.appendLine('[Forge Agent EditSelection] Cancellation requested by user.');
+          await chatProvider.cancel();
+        });
+
+        await chatProvider.sendTurnMessage(turnPrompt);
+
+        while (chatProvider.isRunning() && !token.isCancellationRequested) {
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+    );
+  });
+  context.subscriptions.push(editSelectionCommand);
 
   // Register Sidebar Chat Webview Provider
   const chatProvider = new ForgeChatViewProvider(context.extensionUri, outputChannel);
