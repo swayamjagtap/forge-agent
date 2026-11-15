@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as crypto from 'node:crypto';
+import * as child_process from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as diff from 'diff';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -799,6 +800,110 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
     }
   );
 
+  // 5. run_command(command, timeoutSeconds?)
+  server.registerTool(
+    'run_command',
+    {
+      description: 'Run a shell command in the workspace folder. Returns exit code and combined stdout and stderr.',
+      inputSchema: {
+        command: z.string().describe('Shell command to execute'),
+        timeoutSeconds: z.number().int().positive().optional().describe('Timeout in seconds (default 120, max 300)')
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true
+      }
+    },
+    async (args) => {
+      outputChannel.appendLine(`[${new Date().toISOString()}] Tool called: run_command: ${args.command}`);
+      try {
+        const root = getWorkspaceRoot();
+        const timeoutSec = Math.min(Math.max(1, args.timeoutSeconds ?? 120), 300);
+        const timeoutMs = timeoutSec * 1000;
+
+        const env = { ...process.env };
+        const isWin = process.platform === 'win32';
+        const venvScripts = isWin
+          ? path.join(root, '.venv', 'Scripts')
+          : path.join(root, '.venv', 'bin');
+
+        if (fs.existsSync(venvScripts)) {
+          const pathKey = isWin
+            ? Object.keys(env).find(k => k.toUpperCase() === 'PATH') || 'PATH'
+            : 'PATH';
+          env[pathKey] = `${venvScripts}${path.delimiter}${env[pathKey] || ''}`;
+        }
+
+        outputChannel.appendLine(`[run_command] Executing "${args.command}" in ${root} with timeout ${timeoutSec}s`);
+
+        return await new Promise((resolve) => {
+          let output = '';
+          let killed = false;
+
+          const proc = child_process.spawn(args.command, {
+            cwd: root,
+            shell: true,
+            windowsHide: true,
+            env
+          });
+
+          const timer = setTimeout(() => {
+            killed = true;
+            outputChannel.appendLine(`[run_command] Command timed out after ${timeoutSec}s. Killing process.`);
+            try {
+              if (isWin) {
+                child_process.exec(`taskkill /pid ${proc.pid} /T /F`);
+              } else {
+                proc.kill('SIGKILL');
+              }
+            } catch {
+              proc.kill();
+            }
+          }, timeoutMs);
+
+          const appendOutput = (data: Buffer | string) => {
+            output += data.toString();
+          };
+
+          proc.stdout?.on('data', appendOutput);
+          proc.stderr?.on('data', appendOutput);
+
+          proc.on('error', (err) => {
+            clearTimeout(timer);
+            outputChannel.appendLine(`[run_command] Spawn error: ${err.message}`);
+            resolve({
+              isError: true,
+              content: [{
+                type: 'text',
+                text: `Error spawning command: ${err.message}`
+              }]
+            });
+          });
+
+          proc.on('close', (code) => {
+            clearTimeout(timer);
+            const trimmedOutput = output.length > 6000 ? output.slice(-6000) : output;
+            const exitStatus = killed ? `Command timed out after ${timeoutSec} seconds` : `Exit code: ${code ?? 0}`;
+            const resultText = `${exitStatus}\n${trimmedOutput}`.trim();
+            outputChannel.appendLine(`[run_command] Finished. ${exitStatus}`);
+            resolve({
+              content: [{
+                type: 'text',
+                text: resultText
+              }]
+            });
+          });
+        });
+      } catch (err: any) {
+        outputChannel.appendLine(`[run_command] Error: ${err.message}`);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: `Error in run_command: ${err.message}` }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
@@ -852,6 +957,10 @@ export function formatToolCall(name: string, argsStr: string): { displayName: st
   } else if (typeof input === 'object' && input !== null) {
     if (realName === 'propose_edit' && input.path) {
       argStr = input.path;
+    } else if (realName === 'run_command' && (input.command || input.cmd)) {
+      argStr = input.command || input.cmd;
+    } else if (input.command) {
+      argStr = input.command;
     } else if (input.path) {
       if (input.startLine !== undefined && input.endLine !== undefined) {
         argStr = `${input.path} ${input.startLine}-${input.endLine}`;
@@ -1229,9 +1338,39 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     const root = getWorkspaceRoot();
 
     const proposals: PendingReviewProposal[] = [];
-
     const invalidReasons = new Map<string, string>();
+    const commandApprovals: Array<{ id: string; status: 'allow' | 'deny'; reason?: string }> = [];
+
     for (const ref of toolCallRefs) {
+      // 1. Check if this tool call is run_command
+      let cmdInfo = this._resolveRunCommand(this._turnToolCalls.get(ref.id));
+      if (!cmdInfo) {
+        const saved = await this._fetchToolCallFromServer(ref);
+        if (saved) {
+          cmdInfo = this._resolveRunCommand(saved);
+        }
+      }
+
+      if (cmdInfo) {
+        this._outputChannel.appendLine(`[Forge Agent Approval] Prompting user for run_command: ${cmdInfo.command}`);
+        const selection = await vscode.window.showWarningMessage(
+          `Forge Agent wants to execute command:\n\n${cmdInfo.command}`,
+          { modal: true },
+          'Run',
+          'Deny'
+        );
+
+        if (selection === 'Run') {
+          this._outputChannel.appendLine(`[Forge Agent Approval] User allowed run_command for ${ref.id}`);
+          commandApprovals.push({ id: ref.id, status: 'allow' });
+        } else {
+          this._outputChannel.appendLine(`[Forge Agent Approval] User denied run_command for ${ref.id}`);
+          commandApprovals.push({ id: ref.id, status: 'deny', reason: 'User denied the command' });
+        }
+        continue;
+      }
+
+      // 2. Otherwise check propose_edit
       let normalized = this._resolveProposeEdit(this._turnToolCalls.get(ref.id));
       if (!normalized) {
         // The streamed copy can be incomplete; ask TrueForge for the saved model message instead.
@@ -1310,6 +1449,31 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     if (proposals.length === 0) {
+      if (commandApprovals.length > 0) {
+        // All calls in this event were command approvals (or remaining invalid)
+        const inputs = toolCallRefs.map(ref => {
+          const ca = commandApprovals.find(c => c.id === ref.id);
+          if (ca) {
+            return {
+              type: 'user.tool_approval',
+              thread_id: threadId,
+              tool_call_id: ref.id,
+              approval: ca.status === 'allow' ? { status: 'allow' } : { status: 'deny', reason: ca.reason }
+            };
+          }
+          return {
+            type: 'user.tool_approval',
+            thread_id: threadId,
+            tool_call_id: ref.id,
+            approval: { status: 'deny', reason: invalidReasons.get(ref.id) ?? 'Invalid tool call arguments' }
+          };
+        });
+        this._consecutiveAutoDenials = 0;
+        this._outputChannel.appendLine(`[Forge Agent Approval] Submitting command approval turn: ${JSON.stringify(inputs)}`);
+        await this._runTurn(inputs);
+        return;
+      }
+
       this._consecutiveAutoDenials++;
       this._outputChannel.appendLine(`[Forge Agent Review] Invalid propose_edit arguments. Consecutive count: ${this._consecutiveAutoDenials}`);
 
@@ -1337,7 +1501,37 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     this._history.push(approvalNotice);
     this._postToWebview(approvalNotice);
 
-    this._openReviewPanel(proposals, toolCallRefs, threadId);
+    this._openReviewPanel(proposals, toolCallRefs, threadId, commandApprovals);
+  }
+
+  private _resolveRunCommand(tc: any): { command: string } | null {
+    if (!tc) {
+      return null;
+    }
+    const rawArgs = parseToolArguments(tc.function?.arguments || '');
+    if (!rawArgs || typeof rawArgs !== 'object') {
+      return null;
+    }
+    let toolName = tc.function?.name || tc.tool_info?.name || '';
+    let input = rawArgs;
+    if (toolName === 'call_tool') {
+      toolName = rawArgs.tool_name || '';
+      input = rawArgs.input || {};
+      if (typeof input === 'string') {
+        const parsedInner = parseToolArguments(input);
+        if (parsedInner && typeof parsedInner === 'object') {
+          input = parsedInner;
+        }
+      }
+    }
+    if (toolName !== 'run_command') {
+      return null;
+    }
+    const cmd = input.command || input.cmd;
+    if (typeof cmd === 'string' && cmd.trim()) {
+      return { command: cmd.trim() };
+    }
+    return null;
   }
 
   private _resolveProposeEdit(tc: any): { path: string; edits: ProposedEditItem[]; summary?: string } | null {
@@ -1394,7 +1588,8 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
   private _openReviewPanel(
     proposals: PendingReviewProposal[],
     toolCallRefs: Array<{ id: string; source_event_id?: string }>,
-    threadId: string
+    threadId: string,
+    commandApprovals: Array<{ id: string; status: 'allow' | 'deny'; reason?: string }> = []
   ) {
     if (this._activeReviewPanel) {
       this._activeReviewPanel.dispose();
@@ -1488,12 +1683,22 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
           // Handle any tool calls that were in the event but not in proposals
           for (const ref of toolCallRefs) {
             if (!proposals.some(p => p.toolCallId === ref.id)) {
-              inputItems.push({
-                type: 'user.tool_approval',
-                thread_id: threadId,
-                tool_call_id: ref.id,
-                approval: { status: 'deny', reason: 'Unrecognized tool call.' }
-              });
+              const ca = commandApprovals.find(c => c.id === ref.id);
+              if (ca) {
+                inputItems.push({
+                  type: 'user.tool_approval',
+                  thread_id: threadId,
+                  tool_call_id: ref.id,
+                  approval: ca.status === 'allow' ? { status: 'allow' } : { status: 'deny', reason: ca.reason }
+                });
+              } else {
+                inputItems.push({
+                  type: 'user.tool_approval',
+                  thread_id: threadId,
+                  tool_call_id: ref.id,
+                  approval: { status: 'deny', reason: 'Unrecognized tool call.' }
+                });
+              }
             }
           }
 
@@ -1506,12 +1711,23 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
           isDecided = true;
           panel.dispose();
 
-          const inputItems = toolCallRefs.map(ref => ({
-            type: 'user.tool_approval',
-            thread_id: threadId,
-            tool_call_id: ref.id,
-            approval: { status: 'deny', reason: 'User rejected all proposed edits.' }
-          }));
+          const inputItems = toolCallRefs.map(ref => {
+            const ca = commandApprovals.find(c => c.id === ref.id);
+            if (ca) {
+              return {
+                type: 'user.tool_approval',
+                thread_id: threadId,
+                tool_call_id: ref.id,
+                approval: ca.status === 'allow' ? { status: 'allow' } : { status: 'deny', reason: ca.reason }
+              };
+            }
+            return {
+              type: 'user.tool_approval',
+              thread_id: threadId,
+              tool_call_id: ref.id,
+              approval: { status: 'deny', reason: 'User rejected all proposed edits.' }
+            };
+          });
 
           this._outputChannel.appendLine(`[Forge Agent Review] User clicked Reject All: ${JSON.stringify(inputItems)}`);
           await this._runTurn(inputItems);
@@ -1525,12 +1741,23 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       if (!isDecided) {
         isDecided = true;
         this._outputChannel.appendLine('[Forge Agent Review] Review panel closed by user without decision. Denying pending tool calls.');
-        const denyInputs = toolCallRefs.map(ref => ({
-          type: 'user.tool_approval',
-          thread_id: threadId,
-          tool_call_id: ref.id,
-          approval: { status: 'deny', reason: 'User closed review panel without accepting changes.' }
-        }));
+        const denyInputs = toolCallRefs.map(ref => {
+          const ca = commandApprovals.find(c => c.id === ref.id);
+          if (ca) {
+            return {
+              type: 'user.tool_approval',
+              thread_id: threadId,
+              tool_call_id: ref.id,
+              approval: ca.status === 'allow' ? { status: 'allow' } : { status: 'deny', reason: ca.reason }
+            };
+          }
+          return {
+            type: 'user.tool_approval',
+            thread_id: threadId,
+            tool_call_id: ref.id,
+            approval: { status: 'deny', reason: 'User closed review panel without accepting changes.' }
+          };
+        });
         await this._runTurn(denyInputs);
       }
     });
