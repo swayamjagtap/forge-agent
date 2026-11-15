@@ -149,6 +149,64 @@ export function countOccurrences(source: string, target: string): number {
   return count;
 }
 
+export function parseToolArguments(text: string): any | null {
+  if (typeof text !== 'string' || !text.trim()) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Streamed chunks can be duplicated or cut off; fall back to the first balanced JSON object.
+  }
+  const start = text.indexOf('{');
+  if (start === -1) {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function isCompleteJson(text: string): boolean {
+  if (typeof text !== 'string' || !text.trim()) {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function escapeHtml(str: string): string {
   return str
     .replace(/&/g, '&amp;')
@@ -1023,7 +1081,8 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
                   if (tc.id) {
                     const existing = this._turnToolCalls.get(tc.id);
                     if (existing) {
-                      if (tc.function?.arguments) {
+                      if (tc.function?.arguments && !isCompleteJson(existing.function?.arguments || '')) {
+                        existing.function = existing.function || {};
                         existing.function.arguments = (existing.function.arguments || '') + tc.function.arguments;
                       }
                     } else {
@@ -1092,72 +1151,66 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     const proposals: PendingReviewProposal[] = [];
 
     for (const ref of toolCallRefs) {
-      const tc = this._turnToolCalls.get(ref.id);
-      if (!tc) {
-        this._outputChannel.appendLine(`[Forge Agent Review] Warning: Tool call ${ref.id} not found in tracked tool calls`);
+      let normalized = this._resolveProposeEdit(this._turnToolCalls.get(ref.id));
+      if (!normalized) {
+        // The streamed copy can be incomplete; ask TrueForge for the saved model message instead.
+        const saved = await this._fetchToolCallFromServer(ref);
+        if (saved) {
+          this._outputChannel.appendLine(`[Forge Agent Review] Using tool call ${ref.id} from the saved TrueForge session events`);
+          normalized = this._resolveProposeEdit(saved);
+        }
+      }
+      if (!normalized) {
+        const tracked = this._turnToolCalls.get(ref.id);
+        const snippet = String(tracked?.function?.arguments ?? '(no streamed arguments)').slice(0, 300);
+        this._outputChannel.appendLine(`[Forge Agent Review] Could not read propose_edit arguments for call ${ref.id}. Streamed arguments (first 300 chars): ${snippet}`);
         continue;
       }
 
-      let toolName = tc.function?.name || tc.tool_info?.name || '';
-      let rawArgs: any = {};
       try {
-        rawArgs = JSON.parse(tc.function?.arguments || '{}');
-        if (toolName === 'call_tool') {
-          toolName = rawArgs.tool_name || '';
-        }
-      } catch {
-        // ignore parse error
-      }
+        const targetPath = resolveWorkspacePath(normalized.path, root);
+        const relPath = path.relative(root, targetPath).replace(/\\/g, '/');
+        const fileExists = fs.existsSync(targetPath);
+        const originalContent = fileExists ? await fs.promises.readFile(targetPath, 'utf-8') : '';
 
-      if (toolName === 'propose_edit') {
-        const normalized = normalizeProposeEditArgs(rawArgs);
-        if (normalized) {
-          try {
-            const targetPath = resolveWorkspacePath(normalized.path, root);
-            const relPath = path.relative(root, targetPath).replace(/\\/g, '/');
-            const fileExists = fs.existsSync(targetPath);
-            const originalContent = fileExists ? await fs.promises.readFile(targetPath, 'utf-8') : '';
-
-            let proposedContent = '';
-            if (!fileExists) {
-              proposedContent = normalized.edits[0]?.new_text ?? '';
-            } else {
-              let sim = originalContent;
-              for (const edit of normalized.edits) {
-                const idx = sim.indexOf(edit.old_text);
-                if (idx !== -1) {
-                  sim = sim.slice(0, idx) + edit.new_text + sim.slice(idx + edit.old_text.length);
-                }
-              }
-              proposedContent = sim;
+        let proposedContent = '';
+        if (!fileExists) {
+          proposedContent = normalized.edits[0]?.new_text ?? '';
+        } else {
+          let sim = originalContent;
+          for (const edit of normalized.edits) {
+            const idx = sim.indexOf(edit.old_text);
+            if (idx !== -1) {
+              sim = sim.slice(0, idx) + edit.new_text + sim.slice(idx + edit.old_text.length);
             }
-
-            const patchStr = diff.createTwoFilesPatch(relPath, relPath, originalContent, proposedContent, '', '', { context: 3 });
-            const parsed = diff.parsePatch(patchStr);
-            const rawHunks = parsed[0]?.hunks || [];
-
-            const hunks = rawHunks.map((h: any) => ({
-              oldStart: h.oldStart,
-              oldLines: h.oldLines,
-              newStart: h.newStart,
-              newLines: h.newLines,
-              lines: h.lines
-            }));
-
-            proposals.push({
-              toolCallId: ref.id,
-              threadId,
-              path: normalized.path,
-              summary: normalized.summary || 'Proposed changes',
-              originalContent,
-              proposedContent,
-              edits: normalized.edits,
-              hunks
-            });
-          } catch (err: any) {
-            this._outputChannel.appendLine(`[Forge Agent Review] Error preparing proposal for ${normalized.path}: ${err.message}`);
           }
+          proposedContent = sim;
         }
+
+        const patchStr = diff.createTwoFilesPatch(relPath, relPath, originalContent, proposedContent, '', '', { context: 3 });
+        const parsed = diff.parsePatch(patchStr);
+        const rawHunks = parsed[0]?.hunks || [];
+
+        const hunks = rawHunks.map((h: any) => ({
+          oldStart: h.oldStart,
+          oldLines: h.oldLines,
+          newStart: h.newStart,
+          newLines: h.newLines,
+          lines: h.lines
+        }));
+
+        proposals.push({
+          toolCallId: ref.id,
+          threadId,
+          path: normalized.path,
+          summary: normalized.summary || 'Proposed changes',
+          originalContent,
+          proposedContent,
+          edits: normalized.edits,
+          hunks
+        });
+      } catch (err: any) {
+        this._outputChannel.appendLine(`[Forge Agent Review] Error preparing proposal for ${normalized.path}: ${err.message}`);
       }
     }
 
@@ -1190,6 +1243,57 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     this._postToWebview(approvalNotice);
 
     this._openReviewPanel(proposals, toolCallRefs, threadId);
+  }
+
+  private _resolveProposeEdit(tc: any): { path: string; edits: ProposedEditItem[]; summary?: string } | null {
+    if (!tc) {
+      return null;
+    }
+    const rawArgs = parseToolArguments(tc.function?.arguments || '');
+    if (!rawArgs) {
+      return null;
+    }
+    let toolName = tc.function?.name || tc.tool_info?.name || '';
+    if (toolName === 'call_tool') {
+      toolName = rawArgs.tool_name || '';
+    }
+    if (toolName !== 'propose_edit') {
+      return null;
+    }
+    return normalizeProposeEditArgs(rawArgs);
+  }
+
+  private async _fetchToolCallFromServer(ref: { id: string; source_event_id?: string }): Promise<any | undefined> {
+    if (!this._sessionId) {
+      return undefined;
+    }
+    const config = vscode.workspace.getConfiguration('forgeAgent');
+    const baseUrl = config.get<string>('baseUrl', 'http://localhost:8790').replace(/\/+$/, '');
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/sessions/${this._sessionId}/events?limit=30`);
+      if (!res.ok) {
+        this._outputChannel.appendLine(`[Forge Agent Review] Could not load session events (${res.status})`);
+        return undefined;
+      }
+      const body: any = await res.json();
+      const items: any[] = Array.isArray(body?.data) ? body.data : [];
+      for (const item of items) {
+        const ev = item?.event;
+        if (!ev || ev.type !== 'model.message' || !Array.isArray(ev.tool_calls)) {
+          continue;
+        }
+        if (ref.source_event_id && ev.id !== ref.source_event_id) {
+          continue;
+        }
+        const found = ev.tool_calls.find((c: any) => c?.id === ref.id);
+        if (found) {
+          return found;
+        }
+      }
+    } catch (err: any) {
+      this._outputChannel.appendLine(`[Forge Agent Review] Could not load session events: ${err.message}`);
+    }
+    return undefined;
   }
 
   private _openReviewPanel(
