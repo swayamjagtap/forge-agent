@@ -823,6 +823,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
 
         const env = { ...process.env };
         const isWin = process.platform === 'win32';
+        const cwd = isWin ? root.replace(/^[a-z]:/, d => d.toUpperCase()) : root;
         const venvScripts = isWin
           ? path.join(root, '.venv', 'Scripts')
           : path.join(root, '.venv', 'bin');
@@ -834,14 +835,14 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
           env[pathKey] = `${venvScripts}${path.delimiter}${env[pathKey] || ''}`;
         }
 
-        outputChannel.appendLine(`[run_command] Executing "${args.command}" in ${root} with timeout ${timeoutSec}s`);
+        outputChannel.appendLine(`[run_command] Executing "${args.command}" in ${cwd} with timeout ${timeoutSec}s`);
 
         return await new Promise((resolve) => {
           let output = '';
           let killed = false;
 
           const proc = child_process.spawn(args.command, {
-            cwd: root,
+            cwd,
             shell: true,
             windowsHide: true,
             env
@@ -1299,8 +1300,14 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
               break;
             }
 
+            case 'tool.response': {
+              void this._refreshToolLinesFromServer();
+              break;
+            }
+
             case 'tool.approval_required': {
               this._outputChannel.appendLine(`[Forge Agent Chat] tool.approval_required received with ${event.tool_calls?.length ?? 0} tool call(s)`);
+              void this._refreshToolLinesFromServer();
               await this._handleApprovalRequired(event);
               break;
             }
@@ -1327,8 +1334,57 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       this._history.push(errorMsg);
       this._postToWebview(errorMsg);
     } finally {
+      void this._refreshToolLinesFromServer();
       this._isRunning = false;
       this._postToWebview({ type: 'state', isRunning: false });
+    }
+  }
+
+  private _refreshingToolLines = false;
+
+  // The live stream often delivers call_tool arguments in pieces, so the line says "tool".
+  // The saved session events always hold the complete arguments; use them to fix the wording.
+  private async _refreshToolLinesFromServer(): Promise<void> {
+    if (!this._sessionId || this._refreshingToolLines) {
+      return;
+    }
+    this._refreshingToolLines = true;
+    try {
+      const config = vscode.workspace.getConfiguration('forgeAgent');
+      const baseUrl = config.get<string>('baseUrl', 'http://localhost:8790').replace(/\/+$/, '');
+      const res = await fetch(`${baseUrl}/api/v1/sessions/${this._sessionId}/events?limit=60`);
+      if (!res.ok) {
+        return;
+      }
+      const body: any = await res.json();
+      const items: any[] = Array.isArray(body?.data) ? body.data : [];
+      for (const item of items) {
+        const ev = item?.event;
+        if (!ev || ev.type !== 'model.message' || !Array.isArray(ev.tool_calls)) {
+          continue;
+        }
+        for (const tc of ev.tool_calls) {
+          if (!tc?.id) {
+            continue;
+          }
+          const formatted = formatToolCall(tc.function?.name || tc.tool_info?.name || '', tc.function?.arguments || '');
+          const idx = this._history.findIndex(h => h.type === 'toolCall' && h.toolCallId === tc.id);
+          if (idx !== -1 && this._history[idx].displayName !== formatted.displayName) {
+            this._history[idx].displayName = formatted.displayName;
+            this._history[idx].isMeta = formatted.isMeta;
+            this._postToWebview({
+              type: 'toolCall',
+              toolCallId: tc.id,
+              displayName: formatted.displayName,
+              isMeta: formatted.isMeta
+            });
+          }
+        }
+      }
+    } catch {
+      // cosmetic only: ignore network problems
+    } finally {
+      this._refreshingToolLines = false;
     }
   }
 

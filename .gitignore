@@ -5,3 +5,5 @@ out/
 
 *.bak
 *.bak2
+
+*.bak*
