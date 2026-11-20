@@ -1,6 +1,6 @@
 {
   "name": "editor-test",
-  "description": "Experiment with the editor tools",
+  "description": "VS Code coding assistant powered by TrueFoundry Forge. Uses MCP workspace tools (read_file, search_workspace, list_files, propose_edit, run_command) and supports hunk-by-hunk review and explicit user approval for proposed file edits.",
   "manifest": {
     "model": {
       "name": "google-gemini/gemini-3-5-flash-lite",

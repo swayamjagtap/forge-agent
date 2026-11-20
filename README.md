@@ -8,7 +8,7 @@ The extension opens a sidebar chat connected to a Forge agent session, embeds an
 
 ## Architecture
 
-```
+```text
 ┌────────────────────────────────────────────────────────┐
 │                   VS Code Extension                    │
 │                                                        │
@@ -50,9 +50,9 @@ The extension opens a sidebar chat connected to a Forge agent session, embeds an
 ## Hackathon Requirements Met
 
 | Requirement | Implementation |
-|---|---|
+| --- | --- |
 | VS Code extension as TrueForge client | `src/extension.ts` — sidebar webview + MCP server |
-| All agent messages through TrueForge HTTP API | `POST /api/v1/sessions` and `/api/v1/sessions/{id}/turns` only |
+| All agent messages through TrueForge HTTP API | `POST /api/v1/sessions` and `POST /api/v1/sessions/{id}/turns` only |
 | Workspace tools over MCP | `read_file`, `search_workspace`, `list_files`, `propose_edit`, `run_command` |
 | Proposal-and-review before edits land | Hunk review panel; disk write requires user acceptance |
 | Agent definition included in repository | `agent.json` at the repository root |
@@ -75,7 +75,7 @@ The extension opens a sidebar chat connected to a Forge agent session, embeds an
 ### MCP Tools (`forge-editor`)
 
 | Tool | Description |
-|---|---|
+| --- | --- |
 | `read_file(path, startLine?, endLine?)` | Reads a workspace file with line numbers. Max 20,000 characters. Rejects paths outside the workspace root. |
 | `search_workspace(query, maxResults?)` | Plain-text search. Skips `node_modules`, `.git`, `.venv`, `out`. Max 50 results. |
 | `list_files(subdirectory?)` | File-tree listing. Skips the same ignored directories. Max 200 entries. |
@@ -102,7 +102,7 @@ The extension opens a sidebar chat connected to a Forge agent session, embeds an
 Budget caps are enforced inside the MCP tool handlers, not just in agent instructions:
 
 | Tool | Cap | Resets on |
-|---|---|---|
+| --- | --- | --- |
 | `search_workspace` | 3 distinct queries per task | New chat |
 | `read_file` | 4 reads before the first `propose_edit`; uncapped after | New chat |
 | `list_files` | 1 call per task | New chat |
@@ -131,7 +131,7 @@ Duplicate queries and reads return cached results without consuming budget. Coun
 ## Configuration
 
 | Setting | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `forgeAgent.baseUrl` | `http://localhost:8790` | Base URL of the local TrueForge server. |
 | `forgeAgent.agentName` | `editor-test` | Agent name to use for sessions. Must match the name in `agent.json`. |
 | `forgeAgent.autoFallback` | `true` | Automatically switch models on HTTP 429. |
@@ -159,10 +159,35 @@ npm run compile
 Upload `agent.json` to your running Forge server:
 
 ```bash
+# Default: connects to http://localhost:8790
+npm run sync-agent
+
+# Pass a URL as a command-line argument
+npm run sync-agent -- https://your-forge-server
+
+# Or set the TRUEFORGE_URL environment variable (bash/zsh)
+TRUEFORGE_URL=https://your-forge-server npm run sync-agent
+```
+
+**PowerShell:**
+
+```powershell
+$env:TRUEFORGE_URL = "https://your-forge-server"
 npm run sync-agent
 ```
 
-The script connects to `forgeAgent.baseUrl` (default `http://localhost:8790`), finds or creates an agent named `editor-test`, and updates its manifest. Run this again any time `agent.json` changes.
+`scripts/sync-agent.js` resolves the server URL in this order:
+
+1. Command-line argument (`npm run sync-agent -- <url>`)
+2. `TRUEFORGE_URL` environment variable
+3. `http://localhost:8790` (built-in default)
+
+> **Note:** The VS Code setting `forgeAgent.baseUrl` configures the extension's runtime connection. It is not read by `scripts/sync-agent.js`, which is a standalone Node script. If your Forge server is at a custom URL, pass it explicitly using one of the methods above.
+>
+
+**Authentication:** The sync script sends unauthenticated REST requests. If your Forge server requires authentication headers, the script will receive a non-2xx response and exit with an error. In that case, register the agent manually through your Forge server's UI or API.
+
+The script finds or creates an agent named `editor-test` and updates its manifest from `agent.json`. Run it again any time `agent.json` changes.
 
 ### Step 3 — Verify the model
 
@@ -189,7 +214,7 @@ This runs an 84-test suite that covers diff generation, hunk safety analysis, EO
 ## Commands (Command Palette)
 
 | Command | Description |
-|---|---|
+| --- | --- |
 | `Forge Agent: Edit Selection` | Send the selected code with instructions to the agent (`Ctrl+Alt+K`). |
 | `Forge Agent: Switch Model` | Fetch available models from Forge and switch the active agent model. |
 | `Forge Agent: New Chat` | Start a fresh session and clear exploration counters. |
