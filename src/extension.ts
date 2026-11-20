@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
-import * as crypto from 'node:crypto';
 import * as child_process from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as diff from 'diff';
@@ -11,6 +10,27 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import {
+  ProposedEditItem,
+  computeProposalHash,
+  normalizeProposeEditArgs,
+  fitEol,
+  countOccurrences,
+  parseToolArguments,
+  isCompleteJson,
+  computeHunkMetrics,
+  isDestructiveHunk,
+  isRateLimitError,
+  isToolApprovalPayload,
+  constructFallbackRecoveryInput,
+  selectNextFallbackModel,
+  switchTrueForgeModel,
+  FallbackOrchestrator,
+  DEFAULT_FALLBACK_MODELS,
+  globalBudgetManager,
+} from './editHelpers.js';
+
+export { switchTrueForgeModel };
 
 const SKIPPED_DIRS = new Set(['node_modules', '.git', '.venv', 'out']);
 const MAX_READ_CHARS = 20000;
@@ -19,11 +39,6 @@ const MAX_LIST_ENTRIES = 200;
 
 let httpServer: http.Server | undefined;
 const transports = new Map<string, StreamableHTTPServerTransport>();
-
-export interface ProposedEditItem {
-  old_text: string;
-  new_text: string;
-}
 
 export interface ProposalDecision {
   path: string;
@@ -77,140 +92,6 @@ export class ForgeDiffContentProvider implements vscode.TextDocumentContentProvi
   }
 }
 
-export function computeProposalHash(filePath: string, edits: ProposedEditItem[]): string {
-  const norm = {
-    path: filePath.replace(/\\/g, '/').trim(),
-    edits: edits.map(e => ({ old_text: e.old_text, new_text: e.new_text }))
-  };
-  return crypto.createHash('sha256').update(JSON.stringify(norm)).digest('hex');
-}
-
-export function normalizeProposeEditArgs(raw: any): { path: string; edits: ProposedEditItem[]; summary?: string } | null {
-  if (!raw || typeof raw !== 'object') {
-    return null;
-  }
-  let input = raw;
-  if (typeof raw.input === 'string') {
-    try {
-      input = JSON.parse(raw.input);
-    } catch {
-      input = raw.input;
-    }
-  } else if (raw.input && typeof raw.input === 'object') {
-    input = raw.input;
-  }
-
-  if (!input || typeof input !== 'object') {
-    return null;
-  }
-
-  const filePath = typeof input.path === 'string' ? input.path : (typeof raw.path === 'string' ? raw.path : '');
-  if (!filePath) {
-    return null;
-  }
-
-  const summary = typeof input.summary === 'string' ? input.summary : (typeof raw.summary === 'string' ? raw.summary : undefined);
-
-  if (Array.isArray(input.edits)) {
-    const edits: ProposedEditItem[] = [];
-    for (const e of input.edits) {
-      if (e && typeof e.old_text === 'string' && typeof e.new_text === 'string') {
-        edits.push({ old_text: e.old_text, new_text: e.new_text });
-      } else {
-        return null;
-      }
-    }
-    if (edits.length === 0) {
-      return null;
-    }
-    return { path: filePath, edits, summary };
-  }
-
-  if (typeof input.old_text === 'string' && typeof input.new_text === 'string') {
-    return {
-      path: filePath,
-      edits: [{ old_text: input.old_text, new_text: input.new_text }],
-      summary
-    };
-  }
-
-  return null;
-}
-
-export function fitEol(text: string, eol: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\n/g, eol);
-}
-
-export function countOccurrences(source: string, target: string): number {
-  if (!target) {
-    return 0;
-  }
-  let count = 0;
-  let pos = 0;
-  while ((pos = source.indexOf(target, pos)) !== -1) {
-    count++;
-    pos += target.length;
-  }
-  return count;
-}
-
-export function parseToolArguments(text: string): any | null {
-  if (typeof text !== 'string' || !text.trim()) {
-    return null;
-  }
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Streamed chunks can be duplicated or cut off; fall back to the first balanced JSON object.
-  }
-  const start = text.indexOf('{');
-  if (start === -1) {
-    return null;
-  }
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-    } else if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(text.slice(start, i + 1));
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-export function isCompleteJson(text: string): boolean {
-  if (typeof text !== 'string' || !text.trim()) {
-    return false;
-  }
-  try {
-    JSON.parse(text);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function escapeHtml(str: string): string {
   return str
@@ -361,6 +242,20 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
           };
         }
 
+        const readCheck = globalBudgetManager.checkReadAllowed(args.path, args.startLine, args.endLine);
+        if (!readCheck.allowed) {
+          outputChannel.appendLine(`[read_file] Budget limit reached: ${readCheck.message}`);
+          return {
+            content: [{ type: 'text', text: readCheck.message! }]
+          };
+        }
+        if (readCheck.isDuplicate && readCheck.cachedResult !== undefined) {
+          outputChannel.appendLine(`[read_file] Duplicate read for ${args.path} - returning cached content without consuming budget`);
+          return {
+            content: [{ type: 'text', text: readCheck.cachedResult }]
+          };
+        }
+
         const content = await fs.promises.readFile(targetPath, 'utf-8');
         const lines = content.split(/\r?\n/);
         const totalLines = lines.length;
@@ -383,6 +278,8 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         if (output.length > MAX_READ_CHARS) {
           output = output.slice(0, MAX_READ_CHARS);
         }
+
+        globalBudgetManager.recordRead(args.path, args.startLine, args.endLine, output);
 
         return {
           content: [{ type: 'text', text: output }]
@@ -422,6 +319,19 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         }
 
         const lowerQuery = args.query.toLowerCase();
+        const searchCheck = globalBudgetManager.checkSearchAllowed(lowerQuery);
+        if (!searchCheck.allowed) {
+          outputChannel.appendLine(`[search_workspace] Budget limit reached: ${searchCheck.message}`);
+          return {
+            content: [{ type: 'text', text: searchCheck.message! }]
+          };
+        }
+        if (searchCheck.isDuplicate && searchCheck.cachedResult !== undefined) {
+          outputChannel.appendLine(`[search_workspace] Duplicate search for "${args.query}" - returning cached results without consuming budget`);
+          return {
+            content: [{ type: 'text', text: searchCheck.cachedResult }]
+          };
+        }
 
         async function searchDir(dir: string): Promise<boolean> {
           let entries: fs.Dirent[];
@@ -480,6 +390,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         await searchDir(root);
 
         const resultText = matches.length > 0 ? matches.join('\n') : `No matches found for "${args.query}".`;
+        globalBudgetManager.recordSearch(lowerQuery, resultText);
         return {
           content: [{ type: 'text', text: resultText }]
         };
@@ -504,6 +415,14 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
     },
     async (args) => {
       outputChannel.appendLine(`[${new Date().toISOString()}] Tool called: list_files with arguments: ${JSON.stringify(args)}`);
+
+      const listCheck = globalBudgetManager.checkListFilesAllowed();
+      if (!listCheck.allowed) {
+        outputChannel.appendLine(`[list_files] Budget limit reached: ${listCheck.message}`);
+        return {
+          content: [{ type: 'text', text: listCheck.message! }]
+        };
+      }
 
       try {
         const root = getWorkspaceRoot();
@@ -565,6 +484,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         await walk(startDir);
 
         const resultText = files.length > 0 ? files.join('\n') : 'No files found.';
+        globalBudgetManager.recordListFiles();
         return {
           content: [{ type: 'text', text: resultText }]
         };
@@ -611,6 +531,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
       const { path: normPath, edits: rawEdits, summary: normSummary } = normalized;
       let normEdits = rawEdits;
       outputChannel.appendLine(`[propose_edit] Summary: ${normSummary || '(none)'}`);
+      globalBudgetManager.recordProposal(normPath);
 
       try {
         const root = getWorkspaceRoot();
@@ -684,6 +605,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         const decision = pendingDecisions.get(hash);
 
         if (!decision || decision.acceptedHunks.size === 0) {
+          globalBudgetManager.recordProposalRejected(normPath);
           outputChannel.appendLine(`[propose_edit] No accepted hunks for ${normPath} (hash: ${hash}). Disk write skipped.`);
           return {
             content: [{
@@ -776,6 +698,7 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
         outputChannel.appendLine(`[propose_edit] Saved changes to ${targetPath}`);
 
         pendingDecisions.delete(hash);
+        globalBudgetManager.recordProposalApplied(normPath);
 
         const appliedCount = decision.acceptedHunks.size;
         const rejectedCount = decision.totalHunks - appliedCount;
@@ -816,6 +739,24 @@ function createMcpServer(outputChannel: vscode.OutputChannel): McpServer {
     },
     async (args) => {
       outputChannel.appendLine(`[${new Date().toISOString()}] Tool called: run_command: ${args.command}`);
+      const cmdCheck = globalBudgetManager.canExecuteCommand();
+      if (!cmdCheck.allowed) {
+        outputChannel.appendLine(`[run_command] Blocked: ${cmdCheck.message}`);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: cmdCheck.message! }]
+        };
+      }
+      if (pendingDecisions.size > 0) {
+        outputChannel.appendLine(`[run_command] Blocked: ${pendingDecisions.size} approved proposal(s) are waiting to be written to disk.`);
+        return {
+          isError: true,
+          content: [{
+            type: 'text',
+            text: 'Shell commands and verification tests are blocked because approved edit proposals are still being applied to disk. Please wait for edits to complete.'
+          }]
+        };
+      }
       try {
         const root = getWorkspaceRoot();
         const timeoutSec = Math.min(Math.max(1, args.timeoutSeconds ?? 120), 300);
@@ -995,6 +936,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   private _sessionId?: string;
   private _isRunning: boolean = false;
+  private _fallbackOrchestrator = new FallbackOrchestrator();
   private _history: Array<{ type: string; [key: string]: any }> = [];
   private _turnToolCalls = new Map<string, any>();
   private _activeReviewPanel?: vscode.WebviewPanel;
@@ -1076,6 +1018,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
 
   private async _ensureSession(): Promise<string> {
     if (this._sessionId) {
+      globalBudgetManager.setActiveSessionId(this._sessionId);
       return this._sessionId;
     }
 
@@ -1105,6 +1048,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       throw new Error(`Server returned invalid session response: ${JSON.stringify(sessionJson)}`);
     }
     this._sessionId = sessionJson.data.id;
+    globalBudgetManager.setActiveSessionId(this._sessionId);
     this._outputChannel.appendLine(`[Forge Agent Chat] Session created: ${this._sessionId}`);
     return this._sessionId;
   }
@@ -1121,9 +1065,59 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     await this._runTurn([{ type: 'user.message', content: text }]);
   }
 
-  private async _runTurn(inputItems: any[]) {
+  private async _attemptModelFallback(reason: string, originalInput: any[], retryCount: number = 0): Promise<boolean> {
+    const config = vscode.workspace.getConfiguration('forgeAgent');
+    const autoFallback = config.get<boolean>('autoFallback', true);
+    if (!autoFallback) {
+      return false;
+    }
+
+    const fallbackModels = config.get<string[]>('fallbackModels', DEFAULT_FALLBACK_MODELS);
+    const baseUrl = config.get<string>('baseUrl', 'http://localhost:8790').replace(/\/+$/, '');
+    const agentName = config.get<string>('agentName', 'editor-test');
+    const maxRetries = fallbackModels.length;
+
+    if (retryCount >= maxRetries) {
+      this._outputChannel.appendLine(`[Forge Agent Fallback] Reached maximum fallback retry limit (${maxRetries}). All fallback models exhausted.`);
+      return false;
+    }
+
+    this._outputChannel.appendLine(`[Forge Agent Fallback] Model rate-limit error detected (attempt ${retryCount + 1}/${maxRetries}). Attempting fallback...`);
+
+    return await this._fallbackOrchestrator.handleFallback({
+      reason,
+      originalInput,
+      baseUrl,
+      agentName,
+      fallbackModels,
+      retryCount,
+      maxRetries,
+      logger: this._outputChannel,
+      onModelSwitched: (previousModel, newModel, hadApproval) => {
+        const noticeText = hadApproval
+          ? `⚠️ **Model rate limit** on \`${previousModel}\` after approval was processed.\n\nSwitched to \`${newModel}\` (failover ${retryCount + 1}/${maxRetries}). Continuing from completed tool results...`
+          : `⚠️ **Rate limit** on \`${previousModel}\`.\n\nSwitched to \`${newModel}\` (failover ${retryCount + 1}/${maxRetries}). Preserving session and retrying...`;
+
+        const noticeMsg = { type: 'assistant', text: noticeText };
+        this._history.push(noticeMsg);
+        this._postToWebview(noticeMsg);
+      },
+      executeRetryTurn: async (recoveryInput) => {
+        await this._runTurn(recoveryInput, retryCount + 1);
+      }
+    });
+  }
+
+  private async _runTurn(inputItems: any[], retryCount: number = 0) {
     this._isRunning = true;
     this._postToWebview({ type: 'state', isRunning: true });
+
+    let willFallback = false;
+    let fallbackReason = '';
+
+    const config = vscode.workspace.getConfiguration('forgeAgent');
+    const fallbackModels = config.get<string[]>('fallbackModels', DEFAULT_FALLBACK_MODELS);
+    const maxRetries = fallbackModels.length;
 
     try {
       const sessionId = await this._ensureSession();
@@ -1318,22 +1312,56 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
                 this._history.push(cancelMsg);
                 this._postToWebview(cancelMsg);
               } else if (event.state?.status === 'error') {
-                const errMsgText = event.state?.error?.message || event.state?.error || event.error?.message || event.error || 'Turn ended with error.';
-                const errorMsg = { type: 'error', message: typeof errMsgText === 'string' ? errMsgText : JSON.stringify(errMsgText) };
+                const errMsgText = event.state?.message || event.state?.error?.message || event.state?.error || event.error?.message || event.error || 'Turn ended with error.';
+                const errStr = typeof errMsgText === 'string' ? errMsgText : JSON.stringify(errMsgText);
+
+                if (retryCount < maxRetries && !this._fallbackOrchestrator.isFallingBack && isRateLimitError(errStr)) {
+                  willFallback = true;
+                  fallbackReason = errStr;
+                  break;
+                }
+
+                const errorMsg = { type: 'error', message: errStr };
                 this._history.push(errorMsg);
                 this._postToWebview(errorMsg);
               }
               break;
             }
           }
+          if (willFallback) {
+            break;
+          }
+        }
+        if (willFallback) {
+          try { await reader.cancel(); } catch {}
+          break;
         }
       }
     } catch (err: any) {
       this._outputChannel.appendLine(`[Forge Agent Chat] Error: ${err.message}`);
-      const errorMsg = { type: 'error', message: err.message };
-      this._history.push(errorMsg);
-      this._postToWebview(errorMsg);
+      if (retryCount < maxRetries && !this._fallbackOrchestrator.isFallingBack && isRateLimitError(err.message)) {
+        willFallback = true;
+        fallbackReason = err.message;
+      } else {
+        const errorMsg = { type: 'error', message: err.message };
+        this._history.push(errorMsg);
+        this._postToWebview(errorMsg);
+      }
     } finally {
+      if (!willFallback) {
+        void this._refreshToolLinesFromServer();
+        this._isRunning = false;
+        this._postToWebview({ type: 'state', isRunning: false });
+      }
+    }
+
+    if (willFallback) {
+      const handled = await this._attemptModelFallback(fallbackReason, inputItems, retryCount);
+      if (!handled) {
+        const errorMsg = { type: 'error', message: fallbackReason };
+        this._history.push(errorMsg);
+        this._postToWebview(errorMsg);
+      }
       void this._refreshToolLinesFromServer();
       this._isRunning = false;
       this._postToWebview({ type: 'state', isRunning: false });
@@ -1499,6 +1527,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
           edits: normalized.edits,
           hunks
         });
+        globalBudgetManager.recordProposal(normalized.path);
       } catch (err: any) {
         this._outputChannel.appendLine(`[Forge Agent Review] Error preparing proposal for ${normalized.path}: ${err.message}`);
       }
@@ -1663,6 +1692,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     this._activeReviewPanel = panel;
 
     let isDecided = false;
+    let isApprovalPromptOpen = false;
 
     panel.webview.html = this._getHtmlForReview(panel.webview, proposals);
 
@@ -1694,10 +1724,59 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'applySelected': {
+          if (isDecided || isApprovalPromptOpen) {
+            break;
+          }
+
+          const fileDecisions: Array<{ fileIdx: number; acceptedHunks: number[] }> =
+            Array.isArray(msg.decisions) ? msg.decisions : [];
+
+          // Recompute risk in the extension host. Do not trust webview-supplied risk flags.
+          const hasRiskyAcceptedHunk = fileDecisions.some((fileDecision) => {
+            const prop = proposals[fileDecision.fileIdx];
+            if (!prop || !Array.isArray(fileDecision.acceptedHunks)) {
+              return false;
+            }
+
+            return fileDecision.acceptedHunks.some((hunkIdx) => {
+              if (!Number.isInteger(hunkIdx) || hunkIdx < 0) {
+                return false;
+              }
+
+              const hunk = prop.hunks[hunkIdx];
+              if (!hunk) {
+                return false;
+              }
+
+              return isDestructiveHunk(computeHunkMetrics(hunk), hunk.lines).risky;
+            });
+          });
+
+          if (hasRiskyAcceptedHunk) {
+            isApprovalPromptOpen = true;
+            let selection: string | undefined;
+
+            try {
+              selection = await vscode.window.showWarningMessage(
+                'One or more selected hunks delete existing structural code. Apply these changes?',
+                { modal: true },
+                'Apply anyway'
+              );
+            } finally {
+              isApprovalPromptOpen = false;
+            }
+
+            // A cancelled dialog sends no approval and keeps the review panel open.
+            if (isDecided || selection !== 'Apply anyway') {
+              this._outputChannel.appendLine(
+                '[Forge Agent Review] User cancelled confirmation for destructive edits. No approval sent.'
+              );
+              break;
+            }
+          }
+
           isDecided = true;
           panel.dispose();
-
-          const fileDecisions: Array<{ fileIdx: number; acceptedHunks: number[] }> = msg.decisions || [];
           const decisionsByFileIdx = new Map<number, number[]>();
           for (const d of fileDecisions) {
             decisionsByFileIdx.set(d.fileIdx, d.acceptedHunks);
@@ -1723,6 +1802,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
               });
               this._outputChannel.appendLine(`[Forge Agent Review] Accepted ${accepted.length} hunk(s) for ${prop.path} (hash: ${hash})`);
             } else {
+              globalBudgetManager.recordProposalRejected(prop.path);
               inputItems.push({
                 type: 'user.tool_approval',
                 thread_id: prop.threadId,
@@ -1765,6 +1845,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
 
         case 'rejectAll': {
           isDecided = true;
+          globalBudgetManager.clearPendingReview();
           panel.dispose();
 
           const inputItems = toolCallRefs.map(ref => {
@@ -1796,6 +1877,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       this._activeReviewPanel = undefined;
       if (!isDecided) {
         isDecided = true;
+        globalBudgetManager.clearPendingReview();
         this._outputChannel.appendLine('[Forge Agent Review] Review panel closed by user without decision. Denying pending tool calls.');
         const denyInputs = toolCallRefs.map(ref => {
           const ca = commandApprovals.find(c => c.id === ref.id);
@@ -1842,15 +1924,26 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
         const oldRange = hunk.oldLines > 0 ? `lines ${hunk.oldStart}-${hunk.oldStart + hunk.oldLines - 1}` : `line ${hunk.oldStart}`;
         const newRange = hunk.newLines > 0 ? `lines ${hunk.newStart}-${hunk.newStart + hunk.newLines - 1}` : `line ${hunk.newStart}`;
 
+        const metrics = computeHunkMetrics(hunk);
+        const analysis = isDestructiveHunk(metrics, hunk.lines);
+        const checkedAttr = analysis.risky ? '' : 'checked';
+        const riskyAttr = analysis.risky ? ' data-risky="true"' : '';
+        const countsHtml = `<span class="hunk-counts"><span class="count-add">+${metrics.added}</span> <span class="count-del">-${metrics.deleted}</span></span>`;
+        const warningHtml = analysis.risky
+          ? `<div class="hunk-warning">⚠️ ${escapeHtml(analysis.reason)}</div>`
+          : '';
+
         return `
-        <div class="hunk-card">
+        <div class="hunk-card${analysis.risky ? ' hunk-risky' : ''}">
           <div class="hunk-header">
             <span class="hunk-title">Hunk #${hIdx + 1} (${oldRange} → ${newRange})</span>
+            ${countsHtml}
             <label class="hunk-toggle">
-              <input type="checkbox" class="hunk-checkbox" checked data-file="${fIdx}" data-hunk="${hIdx}">
+              <input type="checkbox" class="hunk-checkbox" ${checkedAttr} data-file="${fIdx}" data-hunk="${hIdx}"${riskyAttr}>
               <span>Accept hunk</span>
             </label>
           </div>
+          ${warningHtml}
           <pre class="hunk-pre">${lineRows}</pre>
         </div>`;
       }).join('');
@@ -1963,10 +2056,38 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       justify-content: space-between;
       align-items: center;
       font-size: 11px;
+      gap: 8px;
     }
     .hunk-title {
       font-family: var(--vscode-editor-font-family, monospace);
       color: var(--vscode-descriptionForeground, #888888);
+      flex: 1;
+    }
+    .hunk-counts {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .count-add {
+      color: #7ee787;
+      font-weight: 600;
+    }
+    .count-del {
+      color: #ffa198;
+      font-weight: 600;
+    }
+    .hunk-warning {
+      padding: 5px 10px;
+      background: rgba(255, 165, 0, 0.12);
+      border-bottom: 1px solid rgba(255, 165, 0, 0.3);
+      font-size: 11px;
+      color: #ffb84d;
+    }
+    .hunk-risky {
+      border-color: rgba(255, 165, 0, 0.4);
+    }
+    .hunk-risky .hunk-header {
+      background: rgba(255, 165, 0, 0.07);
     }
     .hunk-toggle {
       display: inline-flex;
@@ -2079,7 +2200,7 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       const decisions = [];
       proposalsMeta.forEach(meta => {
         const acceptedHunks = [];
-        const checkboxes = document.querySelectorAll(\`.hunk-checkbox[data-file="\${meta.fileIdx}"]\`);
+        const checkboxes = document.querySelectorAll('.hunk-checkbox[data-file="' + meta.fileIdx + '"]');
         checkboxes.forEach(cb => {
           if (cb.checked) {
             acceptedHunks.push(parseInt(cb.getAttribute('data-hunk'), 10));
@@ -2089,7 +2210,6 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
       });
       vscode.postMessage({ type: 'applySelected', decisions });
     });
-
     document.getElementById('rejectAllBtn').addEventListener('click', () => {
       vscode.postMessage({ type: 'rejectAll' });
     });
@@ -2138,6 +2258,11 @@ export class ForgeChatViewProvider implements vscode.WebviewViewProvider {
     if (this._isRunning && this._sessionId) {
       await this._handleCancel();
     }
+    if (this._sessionId) {
+      globalBudgetManager.reset(this._sessionId);
+    }
+    globalBudgetManager.setActiveSessionId('default');
+    globalBudgetManager.reset('default');
     this._sessionId = undefined;
     this._isRunning = false;
     this._history = [];
@@ -2670,6 +2795,76 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ForgeChatViewProvider.viewType, chatProvider)
   );
+
+  // Register command "Forge Agent: Switch Model"
+  const switchModelCommand = vscode.commands.registerCommand('forgeAgent.switchModel', async () => {
+    const config = vscode.workspace.getConfiguration('forgeAgent');
+    const baseUrl = config.get<string>('baseUrl', 'http://localhost:8790').replace(/\/+$/, '');
+    const agentName = config.get<string>('agentName', 'editor-test');
+
+    try {
+      const modelsRes = await fetch(`${baseUrl}/api/v1/models`);
+      if (!modelsRes.ok) {
+        throw new Error(`Failed to fetch models from TrueForge (HTTP ${modelsRes.status})`);
+      }
+      const modelsData = (await modelsRes.json()) as any;
+      const models: Array<{ name: string; model_id?: string }> = modelsData.data || [];
+
+      const agentsRes = await fetch(`${baseUrl}/api/v1/agents`);
+      const agentsData = (await agentsRes.json()) as any;
+      const agent = agentsData.data?.find((a: any) => a.name === agentName);
+      const currentModel = agent?.manifest?.model?.name;
+
+      const items = models.map(m => ({
+        label: m.name,
+        description: m.name === currentModel ? '(Current)' : undefined,
+        detail: m.model_id ? `Model ID: ${m.model_id}` : undefined
+      }));
+
+      const selected = await vscode.window.showQuickPick(items, {
+        placeHolder: `Select a TrueForge model for agent "${agentName}" (Current: ${currentModel || 'unknown'})`
+      });
+
+      if (!selected || selected.label === currentModel) {
+        return;
+      }
+
+      if (!agent) {
+        throw new Error(`Agent "${agentName}" not found on TrueForge server`);
+      }
+
+      const updatedManifest = {
+        ...agent.manifest,
+        model: {
+          ...(agent.manifest?.model || {}),
+          name: selected.label
+        }
+      };
+
+      const putRes = await fetch(`${baseUrl}/api/v1/agents/${agent.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ manifest: updatedManifest })
+      });
+
+      if (!putRes.ok) {
+        throw new Error(`Failed to update agent model (HTTP ${putRes.status})`);
+      }
+
+      outputChannel.appendLine(`[Forge Agent Model] Switched agent "${agentName}" model to "${selected.label}"`);
+      vscode.window.showInformationMessage(`Forge Agent: Switched model to "${selected.label}".`);
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`Forge Agent: Error switching model: ${err.message}`);
+    }
+  });
+  context.subscriptions.push(switchModelCommand);
+
+  // Register command "Forge Agent: New Chat"
+  const newChatCommand = vscode.commands.registerCommand('forgeAgent.newChat', async () => {
+    await chatProvider.startNewChat();
+    vscode.window.showInformationMessage('Forge Agent: Started a new chat session.');
+  });
+  context.subscriptions.push(newChatCommand);
 
   // Embedded MCP Server setup
   const app = createMcpExpressApp();

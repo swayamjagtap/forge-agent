@@ -1,7 +1,7 @@
 {
   "name": "forge-agent",
   "displayName": "Forge Agent",
-  "description": "Minimal VS Code extension for Forge Agent",
+  "description": "VS Code client for TrueFoundry Forge: sidebar chat, MCP workspace tools, and hunk-by-hunk diff review with user approval before any file is written.",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.85.0"
@@ -26,6 +26,14 @@
       {
         "command": "forgeAgent.editSelection",
         "title": "Forge Agent: Edit Selection"
+      },
+      {
+        "command": "forgeAgent.switchModel",
+        "title": "Forge Agent: Switch Model"
+      },
+      {
+        "command": "forgeAgent.newChat",
+        "title": "Forge Agent: New Chat"
       }
     ],
     "keybindings": [
@@ -74,6 +82,24 @@
           "type": "string",
           "default": "editor-test",
           "description": "Agent name to use for chat sessions"
+        },
+        "forgeAgent.autoFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically switch TrueForge agent to a fallback model when rate limited (429)"
+        },
+        "forgeAgent.fallbackModels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "google-gemini/gemini-3-5-flash-lite",
+            "google-gemini/gemini-3-1-flash-lite",
+            "google-gemini/gemini-3-6-flash",
+            "google-gemini/gemini-3-8-flash"
+          ],
+          "description": "List of TrueForge model names to attempt when automatic fallback triggers"
         }
       }
     }
@@ -81,7 +107,9 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "node --test out/editPipeline.test.js",
+    "sync-agent": "node scripts/sync-agent.js"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
